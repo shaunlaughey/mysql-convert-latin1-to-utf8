@@ -4,8 +4,9 @@
  *
  * v1.3
  *
- * Converts incorrect MySQL latin1 columns to UTF8.
- *
+ * Converts incorrect MySQL latin1 columns to UTF8MB4 
+ * and checks for latin1 stored as latin1
+ * and removes any FK's using latin1 columns
  * NOTE: Look for 'TODO's for things you may need to configure.
  *
  * Documentation at:
@@ -13,7 +14,7 @@
  *
  * Or, read README.md.
  *
- * PHP Version 5
+ * PHP Version 7.0
  *
  * @author    Nic Jansma <nic@nicj.net>
  * @copyright 2013 Nic Jansma
@@ -28,31 +29,34 @@ $pretend = true;
 $processEnums = false;
 
 // TODO: The collation you want to convert the overall database to
-$defaultCollation = 'utf8_unicode_ci';
+$defaultCollation = 'utf8mb4_unicode_ci';
 
-// TODO Convert column collations and table defaults using this mapping
+// TODO: The collation for the client to use during the conversion
+$defaultCharset = 'utf8mb4';
+
+// TODO: Convert column collations and table defaults using this mapping
 // latin1_swedish_ci is included since that's the MySQL default
 $collationMap =
  array(
-  'latin1_bin'        => 'utf8_bin',
-  'latin1_general_ci' => 'utf8_unicode_ci',
-  'latin1_swedish_ci' => 'utf8_unicode_ci',
+  'latin1_bin'        => 'utf8mb4_bin',
+  'latin1_general_ci' => 'utf8mb4_unicode_ci',
+  'latin1_swedish_ci' => 'utf8mb4_unicode_ci'
  );
 
-// TODO: Database information
 $dbHost = 'localhost';
 $dbName = '';
 $dbUser = '';
 $dbPass = '';
+$dbPort = '';
+// where to store the corruptable data
+$tmpTable = 'tmp_storage';
+
+// array of tables to process or [] for all tables
+$tablesToConvert = [];
 
 if (file_exists('config.php')) {
     require_once('config.php');
 }
-
-if ($dbPass == '') {
-    echo 'DB password:';
-    $dbPass = trim(fgets(STDIN));
-};
 
 $mapstring = '';
 foreach ($collationMap as $s => $t) {
@@ -61,48 +65,76 @@ foreach ($collationMap as $s => $t) {
 
 // Strip trailing comma
 $mapstring = substr($mapstring, 0, -1);
-echo $mapstring;
+echo $mapstring . PHP_EOL;
 
 // Open a connection to the information_schema database
-$infoDB = new mysqli($dbHost, $dbUser, $dbPass);
+$infoDB = new mysqli($dbHost, $dbUser, $dbPass, 'information_schema', $dbPort);
 $infoDB->select_db('information_schema');
 
 // Open a second connection to the target (to be converted) database
-$targetDB = new mysqli($dbHost, $dbUser, $dbPass);
+$targetDB = new mysqli($dbHost, $dbUser, $dbPass, '', $dbPort);
 $targetDB->select_db($dbName);
+$targetDB->set_charset($defaultCharset);
 
-//
-// TODO: FULLTEXT Indexes
-//
-// You may need to drop FULLTEXT indexes before the conversion -- execute the drop here.
-// eg.
-//    sqlExec($targetDB, "ALTER TABLE MyTable DROP INDEX `my_index_name`", $pretend);
-//
-// If so, you should restore the FULLTEXT index after the conversion -- search for 'TODO'
-// later in this script.
-//
+$createSql = "CREATE TABLE IF NOT EXISTS {$tmpTable}  ( 
+    id int primary key auto_increment not null, 
+    table_id_name varchar(255),
+    table_id varchar(255) not null,
+    table_name varchar(255),
+    column_name varchar(255),
+    binary_value LONGBLOB,
+    latin1_value LONGTEXT collate latin1_general_ci,
+    utf8_value LONGTEXT collate utf8mb4_unicode_ci,
+    insert_date DATETIME
+    )";
+sqlExec($targetDB, $createSql, false);
 
 // Get all tables in the specified database
-$tables = sqlObjs($infoDB,
+$tables = sqlObjs(
+    $infoDB,
     "SELECT TABLE_NAME, TABLE_COLLATION
      FROM   TABLES
-     WHERE  TABLE_SCHEMA = '$dbName'");
+     WHERE  TABLE_SCHEMA = '$dbName'"
+);
 
 foreach ($tables as $table) {
     $tableName      = $table->TABLE_NAME;
     $tableCollation = $table->TABLE_COLLATION;
-
+    if ($tableName == $tmpTable || $tableName=='tmp_storage') {
+        continue;
+    }
+    // if the table is not in the list of tables to convert, skip it
+    if($tablesToConvert && !in_array($tableName,$tablesToConvert)) {
+        continue;
+    }
+   
     // Find all columns whose collation is of one of $mapstring's source types
-    $cols = sqlObjs($infoDB,
+    $cols = sqlObjs(
+        $infoDB,
         "SELECT *
          FROM   COLUMNS
          WHERE  TABLE_SCHEMA    = '$dbName'
             AND TABLE_Name      = '$tableName'
-            AND COLLATION_NAME IN($mapstring)
-            AND COLLATION_NAME IS NOT NULL");
+            AND COLLATION_NAME IN ($mapstring)
+            AND COLLATION_NAME IS NOT NULL"
+    );
 
     $intermediateChanges = array();
     $finalChanges        = array();
+ 
+    $primary_key_search = sqlObjs($infoDB, "SELECT COLUMN_NAME 
+            FROM COLUMNS WHERE TABLE_SCHEMA = '$dbName'
+            AND TABLE_NAME = '$tableName'
+            AND COLUMN_KEY = 'PRI'");
+    if ($primary_key_search) {
+        $primary_key = $primary_key_search[0]->COLUMN_NAME;
+    } else {
+        // not suitable for conversion - no primary key
+        echo "table " . $tableName . " no primary key skipping. " .PHP_EOL;
+        continue;
+    }
+
+
 
     foreach ($cols as $col) {
         // If this column doesn't use one of the collations we want to handle, skip it
@@ -110,6 +142,7 @@ foreach ($tables as $table) {
             continue;
         } else {
             $targetCollation = $collationMap[$col->COLLATION_NAME];
+            echo "Collation Column Found : {$col->COLLATION_NAME}" . PHP_EOL;
         }
 
         // Save current column settings
@@ -152,15 +185,10 @@ foreach ($tables as $table) {
                 $tmpDataType = 'LONGBLOB';
                 break;
 
-            //
-            // TODO: If your database uses the enum type it is safe to uncomment this block if and only if
-            // all of the enum possibilities only use characters in the 0-127 ASCII character set.
-            //
             case 'SET':
             case 'ENUM':
                 $tmpDataType = 'SKIP';
                 if ($processEnums) {
-                    // ENUM data-type isn't using a temporary BINARY type -- just convert its column type directly
                     $finalChanges[] = "MODIFY `$colName` $colType COLLATE $defaultCollation $colNull $colDefault";
                 }
                 break;
@@ -180,6 +208,36 @@ foreach ($tables as $table) {
             exit;
         }
 
+        $checkCorruption = "SELECT {$primary_key}
+         FROM {$tableName} WHERE 
+         CONVERT(CONVERT({$colName} USING BINARY) USING utf8mb4) is null and {$colName} is not null";
+        $result = sqlExec($targetDB, $checkCorruption, false);
+        // if corruption will occur dump the data
+        if ($result && $result->num_rows>0) {
+            echo "TABLE " . $tableName . "." . $colName . " has ".$result->num_rows." rows in LATIN1 not UTF8 which will be lost. SAVING THEM" . PHP_EOL;
+            $sql = "INSERT INTO {$tmpTable} (table_id_name, table_id, table_name, column_name, binary_value, latin1_value, utf8_value, insert_date) 
+                SELECT '{$primary_key}',{$primary_key}, '{$tableName}', '{$colName}', binary({$colName}),
+                CONVERT({$colName} USING latin1),
+                CONVERT({$colName} USING utf8mb4),
+                now() 
+                FROM {$tableName}
+                WHERE CONVERT(CONVERT({$colName} USING BINARY) USING utf8mb4) is null and {$colName} is not null
+            ";
+            sqlExec($targetDB, $sql, false, true);
+            // now clear the data for restoration later
+            $sql = "UPDATE $tableName set {$colName} = ''
+            WHERE CONVERT(CONVERT({$colName} USING BINARY) USING utf8mb4) is null and {$colName} is not null
+            ";
+            sqlExec($targetDB, $sql, $pretend, true);
+            
+        }
+        // check if the data is in a foreign key
+        $a = sqlObjs($infoDB, "SELECT * FROM key_column_usage  WHERE TABLE_SCHEMA = '{$dbName}'  AND
+        TABLE_NAME = '{$tableName}' AND COLUMN_NAME = '{$colName}'");
+        if ($a) {
+            sqlExec($targetDB, "ALTER TABLE {$tableName} DROP FOREIGN KEY {$a[0]->CONSTRAINT_NAME}", $pretend, true);
+        }
+
         // Change the column definition to the new type
         $tempColType = str_ireplace($colDataType, $tmpDataType, $colType);
 
@@ -196,23 +254,21 @@ foreach ($tables as $table) {
 
     // Now run the conversions
     if (count($intermediateChanges) > 0) {
-        sqlExec($targetDB, "ALTER TABLE `$dbName`.`$tableName`\n". implode(",\n", $intermediateChanges), $pretend);
+        sqlExec($targetDB, "ALTER TABLE `$dbName`.`$tableName`\n". implode(",\n", $intermediateChanges), $pretend, true);
     }
 
     if (count($finalChanges) > 0) {
-        sqlExec($targetDB, "ALTER TABLE `$dbName`.`$tableName`\n". implode(",\n", $finalChanges), $pretend);
+        sqlExec($targetDB, "ALTER TABLE `$dbName`.`$tableName`\n". implode(",\n", $finalChanges), $pretend, true);
     }
 }
-
 //
 // TODO: Restore FULLTEXT indexes here
 // eg.
 //    sqlExec($targetDB, "ALTER TABLE MyTable ADD FULLTEXT KEY `my_index_name` (`mycol1`)", $pretend);
-//
-
 // Set the default collation
 sqlExec($infoDB, "ALTER DATABASE `$dbName` COLLATE $defaultCollation", $pretend);
 
+restoreData($targetDB, $tmpTable, $pretend);
 // Done!
 
 //
@@ -227,14 +283,19 @@ sqlExec($infoDB, "ALTER DATABASE `$dbName` COLLATE $defaultCollation", $pretend)
  *
  * @return SQL result
  */
-function sqlExec($db, $sql, $pretend = false)
+function sqlExec($db, $sql, $pretend = false, $echo = false)
 {
-    echo "$sql;\n";
+    if ($echo) {
+        echo "$sql;\n";
+    }
+    $res = null;
     if ($pretend === false) {
-        $res = $db->query($sql); 	
-	if ($res === false) {             
-            $error = $db->error_list[0]['error'];     
-            print "!!! ERROR: $error\n";               
+        $res = $db->query($sql);
+        if ($res === false) {
+            $error = $db->error_list[0]['error'];
+            print "!!! ERROR: $error\n";
+            print "!!! SQL: $sql\n";
+
         }
     }
     return $res;
@@ -263,4 +324,34 @@ function sqlObjs($db, $sql)
     return $a;
 }
 
-?>
+/**
+ * Undocumented function
+ *
+ * @param object $db Target SQL connection
+ * @param integer $pretend flag as to whether to execute or not
+ *
+ * @return void
+ */
+function restoreData($db, $tmpTable, $pretend)
+{
+    // recover data
+    $restoreData = "SELECT table_name FROM `{$tmpTable}` group by table_name";
+    $tables = sqlExec($db, $restoreData, false);
+    if ($tables && $tables->num_rows>0) {
+        foreach ($tables as $table) {
+            $sql = "SELECT id, table_id_name, table_name, column_name FROM `{$tmpTable}` 
+                where table_name = '{$table['table_name']}'";
+            $result = sqlExec($db, $sql, false);
+            foreach ($result as $value) {
+                $record = $value['id'];
+                $table_id_name = $value['table_id_name'];
+                $table_name = $value['table_name'];
+                $column_name = $value['column_name'];
+                $sql = "UPDATE `{$table_name}` a, `{$tmpTable}` t set a.`{$column_name}` = t.`utf8_value` where 
+                        t.`id` = {$record} and a.`{$table_id_name}` = t.`table_id` ";
+                sqlExec($db, $sql, $pretend, true);
+            }
+        }
+    }
+}
+
